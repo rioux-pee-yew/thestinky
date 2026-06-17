@@ -20,6 +20,7 @@ next you want the files in your directory so you will input these commands one a
   cd depth-anything-3
 
 I am not too sure how to make this consistent so I just throw stuff at the wall. The next step is to download torch
+
   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
   
   pip install torch torchvision   
