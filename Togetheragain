@@ -1,0 +1,135 @@
+import os
+import time
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+from depth_anything_3.api import DepthAnything3
+from ultralytics import YOLO
+
+# Hide the xFormers warning if you aren't using it
+os.environ["XFORMERS_DISABLED"] = "1"
+
+# 1. Initialize YOLO and webcam
+print("Initializing YOLOv8...")
+yolo_model = YOLO("yolov8n.pt")
+video_url = "http://192.168.50.123/stream"
+cap = cv2.VideoCapture(video_url)
+
+output_folder = "saved_images"
+if not os.path.exists(output_folder):
+    os.makedirs(output_folder)
+
+# We now save the full captured frame and the bounding box coordinates
+captured_frame = None
+bbox_coords = None  # Will store (x1, y1, x2, y2)
+filename_base = ""
+
+print("\n--- Scanning for a person... Press 'q' to abort manual scanning. ---")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    results = yolo_model(frame, stream=True)
+    display_frame = frame.copy()
+    person_found = False
+
+    for r in results:
+        for box in r.boxes:
+            cls = int(box.cls[0])
+            conf = float(box.conf[0])
+
+            # Class 0 is 'person' with >= 90% confidence
+            if cls == 0 and conf >= 0.90:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                h, w, _ = frame.shape
+                # Ensure coordinates stay within frame boundaries
+                bbox_coords = (max(0, y1), min(h, y2), max(0, x1), min(w, x2))
+
+                # Capture the ENTIRE frame, not just the crop
+                captured_frame = frame.copy()
+
+                timestamp = time.strftime("%Y%m%d-%H%M%S")
+                filename_base = f"{output_folder}/scene_{timestamp}"
+                person_found = True
+                break
+        if person_found:
+            break
+
+    if person_found and captured_frame is not None:
+        raw_img_path = f"{filename_base}_raw.jpg"
+        cv2.imwrite(raw_img_path, captured_frame)
+        print(f"\n[TARGET ACQUIRED] Person detected! Full frame saved to {raw_img_path}")
+        break
+
+    cv2.imshow("YOLO Scanner Active", display_frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        print("Scanning aborted by user.")
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+
+# 2. Process Full Image with Depth Anything Metric
+if captured_frame is not None and bbox_coords is not None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\nUsing device for Depth Estimation: {device}")
+
+    print("Loading Depth Anything V3 Metric Model...")
+    depth_model = DepthAnything3.from_pretrained("depth-anything/DA3METRIC-LARGE").to(device=device)
+
+    print("Predicting full-frame metric depth map...")
+    frame_rgb = cv2.cvtColor(captured_frame, cv2.COLOR_BGR2RGB)
+    pil_image = Image.fromarray(frame_rgb)
+
+    with torch.no_grad():
+        prediction = depth_model.inference([pil_image])
+        # This is a full-frame depth map matching your webcam resolution
+        full_metric_depth_map = prediction.depth[0]
+
+        # 3. Extract the depth of the bounding box
+    y1, y2, x1, x2 = bbox_coords
+
+    # Slice the depth map to get only the pixels inside the person's bounding box
+    bbox_depth_zone = full_metric_depth_map[y1:y2, x1:x2]
+
+    # Calculate metrics inside the bounding box
+    # Using median is often better than mean because it ignores background pixels
+    # that might peek into the edges of the box.
+    median_distance = np.median(bbox_depth_zone)
+    mean_distance = np.mean(bbox_depth_zone)
+    min_distance = np.min(bbox_depth_zone)
+
+    print("\n" + "=" * 40)
+    print(f"BOUNDING BOX DEPTH ANALYSIS:")
+    print(f"Estimated Distance (Median): {median_distance:.2f} meters")
+    print(f"Estimated Distance (Mean):   {mean_distance:.2f} meters")
+    print(f"Closest Point on Person:     {min_distance:.2f} meters")
+    print("=" * 40 + "\n")
+
+    # 4. Post-process and normalize full frame ONLY for visualization
+    depth_min, depth_max = full_metric_depth_map.min(), full_metric_depth_map.max()
+    if depth_max - depth_min > 0:
+        normalized_depth = (full_metric_depth_map - depth_min) / (depth_max - depth_min)
+    else:
+        normalized_depth = full_metric_depth_map
+    normalized_depth = (normalized_depth * 255).astype(np.uint8)
+
+    color_depth = cv2.applyColorMap(normalized_depth, cv2.COLORMAP_INFERNO)
+
+    # Draw the YOLO bounding box onto the depth visualizer map so you can see it
+    cv2.rectangle(color_depth, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.putText(color_depth, f"{median_distance:.2f}m", (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    depth_color_path = f"{filename_base}_depth_color.jpg"
+    cv2.imwrite(depth_color_path, color_depth)
+
+    print(f"[SUCCESS] Saved full colored depth map with overlay to: {depth_color_path}")
+else:
+    print("No target was captured. Exiting script.")
+
+print("Processing Complete!")
